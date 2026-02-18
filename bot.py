@@ -544,7 +544,6 @@ async def question_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_message(chat_id=chat_id, text="⌛ Time up. Moving to next question.")
 
     if session.unanswered_streak >= 5:
-        await context.bot.send_message(chat_id=chat_id, text="🛑 Quiz stopped after 5 consecutive unanswered questions.")
         await finish_quiz(chat_id, user_id, context)
         return
 
@@ -554,47 +553,32 @@ async def question_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-
-    user_id = update.effective_user.id
+    user_id = query.from_user.id
     ud = context.application.user_data.get(user_id, {})
     session: Optional[Session] = ud.get("session")
-    if not session or session.current >= len(session.questions):
-        await query.edit_message_text("⚠️ No active question. Start again with /quiz.")
+    if not session:
         return
-
-    for key in ("warn_job", "timeout_job"):
-        job = ud.get(key)
-        if job:
-            job.schedule_removal()
-            ud[key] = None
-
-    question = session.questions[session.current]
 
     if query.data == "skip":
+        session.current += 1
         session.unanswered_streak += 1
-        feedback = "⏭️ Skipped."
+        await query.message.edit_reply_markup(reply_markup=None)
+        await query.message.reply_text("⏩ Question skipped.")
     else:
-        selected = int(query.data.split(":", maxsplit=1)[1])
-        if selected == question.answer_index:
+        idx = int(query.data.split(":")[1])
+        question = session.questions[session.current]
+        session.current += 1
+        session.unanswered_streak = 0
+        if idx == question.correct_index:
             session.score += 1
-            session.unanswered_streak = 0
-            feedback = f"✅ Correct!\n{question.explanation}"
+            await query.message.reply_text("✅ Correct!")
         else:
-            session.unanswered_streak = 0
-            feedback = f"❌ Wrong. Correct answer: *{question.options[question.answer_index]}*"
+            await query.message.reply_text(f"❌ Wrong. Correct answer: {question.options[question.correct_index]}")
 
-    await query.edit_message_text(feedback, parse_mode=ParseMode.MARKDOWN)
-    session.current += 1
-
-    if session.unanswered_streak >= 5:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="🛑 Quiz stopped after 5 consecutive unanswered questions.",
-        )
-        await finish_quiz(update.effective_chat.id, user_id, context)
-        return
-
-    await send_question(update.effective_chat.id, user_id, context)
+    if session.current >= len(session.questions) or session.unanswered_streak >= 5:
+        await finish_quiz(query.message.chat_id, user_id, context)
+    else:
+        await send_question(query.message.chat_id, user_id, context)
 
 
 async def finish_quiz(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -604,209 +588,160 @@ async def finish_quiz(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_
         return
 
     total = len(session.questions)
-    grade, status, level = grade_result(session.score, total)
-    percent = round((session.score / total) * 100, 2) if total else 0
+    score = session.score
+    grade, status, level = grade_result(score, total)
     profile = get_user(user_id)
     batch = profile["batch"] if profile else "Unknown"
+    store_result(user_id, score, total, grade, status, level, batch)
 
-    store_result(user_id, session.score, total, grade, status, level, batch)
-
-    result_text = (
-        "🏁 *Quiz Completed*\n"
-        f"👤 Name: {profile['full_name'] if profile else 'N/A'}\n"
-        f"🎂 Age: {profile['age'] if profile else 'N/A'}\n"
-        f"🏷️ Batch: {batch}\n"
-        f"📊 Score: {session.score}/{total} ({percent}%)\n"
-        f"🧾 Grade: {grade}\n"
-        f"📌 Status: {status}\n"
-        f"🌈 Level: {level}"
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"🏁 Quiz Completed!\n"
+            f"Score: {score}/{total}\n"
+            f"Percentage: {round((score/total)*100,2)}%\n"
+            f"Grade: {grade}\n"
+            f"Status: {status}\n"
+            f"Level: {level}"
+        ),
+        reply_markup=main_menu(),
     )
-    await context.bot.send_message(chat_id=chat_id, text=result_text, parse_mode=ParseMode.MARKDOWN)
-
-    admin_text = (
-        "📥 *Student Finished Quiz*\n"
-        f"ID: `{user_id}`\n"
-        f"Name: {profile['full_name'] if profile else 'N/A'}\n"
-        f"Batch: {batch}\n"
-        f"Score: {session.score}/{total} ({percent}%)\n"
-        f"Reply with /feedback {user_id} <message>"
-    )
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(admin_id, admin_text, parse_mode=ParseMode.MARKDOWN)
-        except Exception as exc:
-            logger.warning("Cannot notify admin %s: %s", admin_id, exc)
 
     ud.pop("session", None)
+    for key in ("warn_job", "timeout_job"):
+        job = ud.get(key)
+        if job:
+            job.schedule_removal()
 
 
 async def my_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    touch_activity(user.id)
-
-    profile = get_user(user.id)
-    if not profile:
-        await update.effective_message.reply_text("Please register first with /start.")
-        return
-
-    result = latest_result(user.id)
-    if not result:
-        await update.effective_message.reply_text(
-            f"👤 {profile['full_name']}\n🎂 {profile['age']}\n🏷️ {profile['batch']}\nNo quiz attempt yet.",
-            reply_markup=main_menu(),
-        )
+    user_id = update.effective_user.id
+    res = latest_result(user_id)
+    if not res:
+        await update.effective_message.reply_text("You have not taken any quiz yet.")
         return
 
     await update.effective_message.reply_text(
-        f"👤 {profile['full_name']}\n"
-        f"🎂 {profile['age']}\n"
-        f"🏷️ {profile['batch']}\n"
-        f"📊 Last Score: {result['score']}/{result['total']} ({result['percentage']}%)\n"
-        f"🧾 Grade: {result['grade']} | {result['status']} | {result['level']}",
-        reply_markup=main_menu(),
+        f"📊 Your Latest Quiz:\n"
+        f"Score: {res['score']}/{res['total']}\n"
+        f"Percentage: {res['percentage']}%\n"
+        f"Grade: {res['grade']}\n"
+        f"Status: {res['status']}\n"
+        f"Level: {res['level']}"
     )
 
 
-def format_leaderboard(title: str, rows: Iterable[sqlite3.Row]) -> List[str]:
-    lines = [title]
-    for index, row in enumerate(rows, start=1):
-        lines.append(f"{index}. {row['full_name']} ({row['batch']}) - {row['percentage']}%")
-    if len(lines) == 1:
-        lines.append("• No data yet")
-    return lines
-
-
 async def top_students_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    touch_activity(update.effective_user.id)
+    rows = leaderboard()
+    if not rows:
+        await update.effective_message.reply_text("No leaderboard data yet.")
+        return
 
-    blocks = []
-    blocks.extend(format_leaderboard("🏆 *Top Students (All Batches)*", leaderboard(None, 10)))
-    blocks.append("")
-    blocks.extend(format_leaderboard("📌 *Top Batch 1*", leaderboard("Batch 1", 3)))
-    blocks.append("")
-    blocks.extend(format_leaderboard("📌 *Top Batch 2*", leaderboard("Batch 2", 3)))
-    blocks.append("")
-    blocks.extend(format_leaderboard("📌 *Top Batch 3*", leaderboard("Batch 3", 3)))
-
-    await update.effective_message.reply_text("\n".join(blocks), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+    msg = "🏆 Top Students:\n"
+    for i, r in enumerate(rows, 1):
+        msg += f"{i}. {r['full_name']} ({r['batch']}): {r['percentage']}%\n"
+    await update.effective_message.reply_text(msg)
 
 
 async def bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    touch_activity(update.effective_user.id)
     stats = usage_stats()
     await update.effective_message.reply_text(
-        "📈 *Bot Status*\n"
-        f"Daily users (today): {stats['daily']}\n"
-        f"Monthly users (sum of daily users): {stats['monthly']}",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_menu(),
+        f"🤖 Bot Usage:\nToday: {stats['daily']} users\nThis month: {stats['monthly']} users"
     )
 
 
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    touch_activity(update.effective_user.id)
-    await update.effective_message.reply_text(ABOUT_US, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+    await update.effective_message.reply_text(ABOUT_US, parse_mode=ParseMode.MARKDOWN)
 
 
 async def story(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    touch_activity(update.effective_user.id)
-    await update.effective_message.reply_text(OUR_STORY, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+    await update.effective_message.reply_text(OUR_STORY, parse_mode=ParseMode.MARKDOWN)
 
 
 async def job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    touch_activity(update.effective_user.id)
-    await update.effective_message.reply_text(SERVICES, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+    await update.effective_message.reply_text("📋 Currently no job listings. Stay tuned!")
 
 
 async def social(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    touch_activity(update.effective_user.id)
-    await update.effective_message.reply_text(SOCIALS, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+    await update.effective_message.reply_text(SOCIALS, parse_mode=ParseMode.MARKDOWN)
 
 
 async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    touch_activity(update.effective_user.id)
-    await update.effective_message.reply_text(CONTACT, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+    await update.effective_message.reply_text(CONTACT, parse_mode=ParseMode.MARKDOWN)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    touch_activity(update.effective_user.id)
     await update.effective_message.reply_text(
         "🆘 *Help Menu*\n"
-        "/start - Register\n"
-        "/quiz - Start quiz\n"
-        "/mystatus - Your status\n"
-        "/top - Leaderboard\n"
-        "/botstatus - Daily & monthly users\n"
-        "/about - About us\n"
-        "/story - Our story\n"
-        "/job - Services\n"
-        "/social - Social links\n"
-        "/contact - Contact details\n"
-        "/help - This help",
+        "• /start — Register and start quiz\n"
+        "• /quiz — Start quiz\n"
+        "• /mystatus — View latest score\n"
+        "• /top — View leaderboard\n"
+        "• /botstatus — Bot usage stats\n"
+        "• /about — About us\n"
+        "• /story — Our story\n"
+        "• /social — Social media\n"
+        "• /contact — Contact info",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_menu(),
     )
+
+
+async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "💬 Send us your feedback anytime at: aser972912@gmail.com"
+    )
+
+
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.effective_message.text.strip()
+    if text == "🧩 Start Quiz":
+        await quiz(update, context)
+    elif text == "📊 My Status":
+        await my_status(update, context)
+    elif text == "🏆 Top Students":
+        await top_students_cmd(update, context)
+    elif text == "📈 Bot Status":
+        await bot_status(update, context)
+    elif text == "ℹ️ About Us":
+        await about(update, context)
+    elif text == "📖 Our Story":
+        await story(update, context)
+    elif text == "💼 Job":
+        await job(update, context)
+    elif text == "🌐 Social Media":
+        await social(update, context)
+    elif text == "📞 Contact":
+        await contact(update, context)
+    elif text == "🆘 Help":
+        await help_cmd(update, context)
+    else:
+        await update.effective_message.reply_text("❓ Unrecognized command. Use the menu below.", reply_markup=main_menu())
 
 
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await is_admin(update):
-        await update.effective_message.reply_text("🚫 Admin only.")
+        await update.effective_message.reply_text("❌ You are not admin.")
         return ConversationHandler.END
-    await update.effective_message.reply_text("📣 Send the broadcast message now:")
+
+    await update.effective_message.reply_text("📝 Send the message to broadcast to all users.")
     return BROADCAST_WAIT
 
 
 async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    message = update.effective_message.text
-    recipients = all_user_ids()
-    sent = 0
+    if not await is_admin(update):
+        await update.effective_message.reply_text("❌ You are not admin.")
+        return ConversationHandler.END
 
-    for user_id in recipients:
+    text = update.effective_message.text
+    user_ids = all_user_ids()
+    for uid in user_ids:
         try:
-            await context.bot.send_message(chat_id=user_id, text=f"📢 *Announcement*\n\n{message}", parse_mode=ParseMode.MARKDOWN)
-            sent += 1
+            await context.bot.send_message(uid, text)
         except Exception:
             continue
 
-    await update.effective_message.reply_text(f"✅ Broadcast done. Sent to {sent}/{len(recipients)} users.")
+    await update.effective_message.reply_text(f"✅ Broadcast sent to {len(user_ids)} users.")
     return ConversationHandler.END
-
-
-async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_admin(update):
-        await update.effective_message.reply_text("🚫 Admin only.")
-        return
-
-    if len(context.args) < 2 or not context.args[0].isdigit():
-        await update.effective_message.reply_text("Usage: /feedback <user_id> <message>")
-        return
-
-    user_id = int(context.args[0])
-    message = " ".join(context.args[1:])
-    try:
-        await context.bot.send_message(chat_id=user_id, text=f"📬 *Admin Feedback*\n\n{message}", parse_mode=ParseMode.MARKDOWN)
-        await update.effective_message.reply_text("✅ Feedback sent.")
-    except Exception as exc:
-        await update.effective_message.reply_text(f"❌ Failed to send feedback: {exc}")
-
-
-async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (update.effective_message.text or "").strip()
-    mapping = {
-        "🧩 Start Quiz": quiz,
-        "📊 My Status": my_status,
-        "🏆 Top Students": top_students_cmd,
-        "📈 Bot Status": bot_status,
-        "💼 Job": job,
-        "ℹ️ About Us": about,
-        "📖 Our Story": story,
-        "🌐 Social Media": social,
-        "🆘 Help": help_cmd,
-        "📞 Contact": contact,
-    }
-    handler = mapping.get(text)
-    if handler:
-        await handler(update, context)
 
 
 def build_app() -> Application:
@@ -815,7 +750,7 @@ def build_app() -> Application:
     if not token:
         raise RuntimeError("BOT_TOKEN is missing. Put it in .env")
 
-    app = Application.builder().token(token).build()
+    application = Application.builder().token(token).build()
 
     registration = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -835,24 +770,23 @@ def build_app() -> Application:
         fallbacks=[],
     )
 
-    app.add_handler(registration)
-    app.add_handler(broadcast)
+    application.add_handler(registration)
+    application.add_handler(broadcast)
+    application.add_handler(CommandHandler("quiz", quiz))
+    application.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^(ans:\d+|skip)$"))
+    application.add_handler(CommandHandler("mystatus", my_status))
+    application.add_handler(CommandHandler("top", top_students_cmd))
+    application.add_handler(CommandHandler("botstatus", bot_status))
+    application.add_handler(CommandHandler("about", about))
+    application.add_handler(CommandHandler("story", story))
+    application.add_handler(CommandHandler("job", job))
+    application.add_handler(CommandHandler("social", social))
+    application.add_handler(CommandHandler("contact", contact))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("feedback", feedback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router), group=20)
 
-    app.add_handler(CommandHandler("quiz", quiz))
-    app.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^(ans:\d+|skip)$"))
-    app.add_handler(CommandHandler("mystatus", my_status))
-    app.add_handler(CommandHandler("top", top_students_cmd))
-    app.add_handler(CommandHandler("botstatus", bot_status))
-    app.add_handler(CommandHandler("about", about))
-    app.add_handler(CommandHandler("story", story))
-    app.add_handler(CommandHandler("job", job))
-    app.add_handler(CommandHandler("social", social))
-    app.add_handler(CommandHandler("contact", contact))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("feedback", feedback))
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router), group=20)
-    return app
+    return application
 
 
 def main() -> None:
@@ -864,5 +798,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-question_bank.py
-question_bank.py
