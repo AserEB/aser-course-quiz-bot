@@ -1,10 +1,5 @@
-# Telegram bot
 python-telegram-bot==20.5
-
-# Web server
 Flask==3.1.3
-
-# HTTP clients (required by python-telegram-bot)
 httpx==0.24.1
 httpcore==0.17.3
 anyio==4.12.1
@@ -12,8 +7,6 @@ h11==0.14.0
 sniffio==1.3.1
 certifi==2026.1.4
 idna==3.11
-
-# Flask dependencies
 click==8.3.1
 blinker==1.9.0
 itsdangerous==2.2.0
