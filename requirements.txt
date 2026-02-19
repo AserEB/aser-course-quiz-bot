@@ -1,4 +1,2 @@
-python-telegram-bot==20.3
-python-dotenv==1.0.1
-APScheduler==3.10.4
-httpx~=0.24.0
+python-telegram-bot==20.5
+Flask==3.1.3
