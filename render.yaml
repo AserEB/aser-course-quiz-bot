@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: aser-course-quiz-bot
+    runtime: python
+    buildCommand: ""
+    startCommand: gunicorn app:app
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
