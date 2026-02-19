@@ -355,5 +355,5 @@ if __name__ == "__main__":
     application.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
-        webhook_url=f"https://your-render-url.onrender.com/{TOKEN}",
+        webhook_url=f"https://aser-course-quiz-bot.onrender.com/{TOKEN}",
     )
